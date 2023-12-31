@@ -1,0 +1,5 @@
+configobj
+pillow
+geopy
+icecream
+certifi
