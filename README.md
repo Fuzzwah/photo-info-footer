@@ -5,6 +5,10 @@ A python script that reads exif data from an image file and saves a copy of the 
 
 It works on my machine.
 
+## Demo:
+
+<img width="500" alt="image" src="https://github.com/Fuzzwah/photo-info-footer/assets/658935/a3fcf02b-7f19-40fb-8108-c8fa48b05191">
+
 ## TODO:
 
 - scale footer size with image size
