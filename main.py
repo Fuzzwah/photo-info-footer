@@ -22,13 +22,11 @@ SYNOPSIS
 
 DESCRIPTION
 
-    TODO This describes how to use this script. This docstring
-    will be printed by the script if there is an error or
-    if the user requests help (-h or --help).
+    A python script that reads exif data from an image file and saves a copy of the file with a footer displaying date and location information.
 
 EXAMPLES
 
-    TODO: Show some examples of how to use this script.
+    python main.py -i /path/to/input/folder -o /path/to/output/folder
 
 AUTHOR
 
@@ -42,16 +40,22 @@ VERSION
 __program__ = "photo-info-footer"
 __author__ = "Robert Crouch (rob.crouch@gmail.com)"
 __copyright__ = "Copyright (C) 2023- Robert Crouch"
-__license__ = "LGPL 3.0"
-__version__ = "v0.231231"
+__license__ = "AGPL-3.0"
+__version__ = "v0.20240108"
 
 import os
 import sys
 import argparse
 import logging, logging.handlers
 from datetime import datetime
+import re
 
 from geopy.geocoders import Nominatim
+from geopy.exc import (
+    GeocoderServiceError,
+    GeocoderTimedOut,
+    GeocoderUnavailable,
+)
 
 import configobj
 from PIL import (
@@ -92,11 +96,12 @@ class App(object):
 
         # loop through the files and remove any that aren't images
         for f in files:
-            if not f.lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
+            if not f.lower().endswith((".jpg", ".jpeg")):
                 files.remove(f)
 
         # prepend the full path to the files
         files = [os.path.join(self.args.input, f) for f in files]
+        files.sort()
 
         return files
 
@@ -108,10 +113,15 @@ class App(object):
         files = self.get_image_files()
 
         # loop through the files
-        for f in files:
-            img, date_string, location_string = self.process_image(f)
-            ic((f, date_string, location_string))
-            self.add_footer(f, img, date_string, location_string)
+        for filename in files:
+            # Check that the filaname doesn't already exist in the output directory
+            if not self.args.overwrite and os.path.exists(os.path.join(self.args.output, os.path.basename(filename))):
+                pass
+            else:
+                img, date_string, location_string = self.process_image(filename)
+                ic((filename, date_string, location_string))
+                if date_string:
+                    self.add_footer(filename, img, date_string, location_string)
 
     def process_image(self, filename):
         """ Uses PIL to read the exif data from the image file, then adds a footer to the image listing the date and location. The location string is converted from the coordinates in the exif data to a human readable string using the geopy library.
@@ -123,16 +133,53 @@ class App(object):
         # Get the exif data
         exif_data = img._getexif()
 
+        latitude = None
+        longitude = None
         date_string = None
         location_string = None
+
+        if not exif_data:
+            return img, date_string, location_string
 
         # Get the tag name for 'DateTimeOriginal' and 'GPSInfo'
         for tag, value in exif_data.items():
             tagname = ExifTags.TAGS.get(tag, tag)
 
-            # If the tag name is 'DateTimeOriginal', store its value in 'date'
+            # rotate the photo if required
+            if tagname == 'Orientation':
+                if value == 3:
+                    img = img.rotate(180, expand=True)
+                elif value == 6:
+                    img = img.rotate(270, expand=True)
+                elif value == 8:
+                    img = img.rotate(90, expand=True)
+
+            # If the tag name is 'DateTimeOriginal', store its value in 'date_string' in the format 'Jan 2018'
             if tagname == 'DateTimeOriginal':
-                date_string = datetime.strptime(value, "%Y:%m:%d %H:%M:%S").strftime("%B %Y")
+                try:
+                    date_string = datetime.strptime(value, "%Y:%m:%d %H:%M:%S").strftime("%b %Y")
+                except ValueError as exc:
+                    date_string = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%b %Y")
+                except:
+                    ic(filename)
+                    ic(value)
+            
+            if date_string is None:
+                if tagname == 'DateTime':
+                    try:
+                        date_string = datetime.strptime(value, "%Y:%m:%d %H:%M:%S").strftime("%b %Y")
+                    except ValueError as exc:
+                        date_string = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%b %Y")
+                    except:
+                        ic(filename)
+                        ic(value)
+            
+            if date_string is None:
+                # use regex check for a date in the filename in format 20180520_093724
+                pattern = re.compile(r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
+                match = pattern.search(filename)
+                if match:
+                    date_string = datetime.strptime(match.group(0), "%Y%m%d_%H%M%S").strftime("%b %Y")
 
             # If the tag name is 'GPSInfo', store its value in 'gps_data'
             if tagname == 'GPSInfo':
@@ -148,17 +195,32 @@ class App(object):
                     # Convert the latitude and longitude to decimal degrees
                     latitude = dms_to_decimal(latitude_dms, latitude_ref)
                     longitude = dms_to_decimal(longitude_dms, longitude_ref)
+                else:
+                    if self.args.debug:
+                        ic(filename)
+                        ic(gps_data)
+                    return img, date_string, None
 
                 # Use geopy to convert the coordinates into a location
                 geolocator = Nominatim(user_agent="photo-info-footer")
-                location = geolocator.reverse([latitude, longitude], exactly_one=True)
+                try:
+                    location = geolocator.reverse([latitude, longitude], exactly_one=True)
+                except (GeocoderTimedOut, GeocoderServiceError, GeocoderUnavailable) as exc:
+                    ic(exc)
+                    return self.process_image(filename)
+                
                 if location:
-                    if 'suburb' in location.raw['address'].keys():
-                        location_string = location.raw['address']['suburb']
-                    elif 'city_district' in location.raw['address'].keys():
-                        location_string = location.raw['address']['city_district']
-                    elif 'city' in location.raw['address'].keys():
-                        location_string = location.raw['address']['city']
+                    location_string_priority = ['tourism', 'hamlet', 'suburb', 'town', 'municipality', 'city_district', 'city']
+                    for p in location_string_priority:
+                        if p in location.raw['address'].keys():
+                            location_string = location.raw['address'][p]
+                            break
+                    if not location_string:
+                        location_string = location.raw['address']['country']
+
+                    if not location_string:
+                        ic(filename)
+                        ic(location.raw['address'])
 
         return img, date_string, location_string
 
@@ -173,6 +235,12 @@ class App(object):
         # Get the width and height of the image
         width, height = img.size
 
+        # The footer height should be 3% of the image height
+        footer_height = int(height * 0.03)
+
+        # The text size should be 80% of the footer height
+        text_size = int(footer_height * 0.8)
+
         # Create a semi-transparent rectangle
         rectangle = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(rectangle)
@@ -181,13 +249,16 @@ class App(object):
         # Composite the rectangle onto the image
         img = Image.alpha_composite(img.convert('RGBA'), rectangle)
 
-        # Calculate the position of the text
-        text_x = 30
-        text_y = height - 140
+        # The text should have a left margin of 1% of the image width
+        text_x = int(width * 0.01)
+        text_y = height - footer_height
 
-        text = f"{location_string} | {date_string}"
+        if location_string:
+            text = f"{date_string} > {location_string}"
+        else:
+            text = date_string
         draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default(100)
+        font = ImageFont.load_default(text_size)
 
         # Draw the text onto the image
         draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255, 255))
@@ -208,7 +279,8 @@ def parse_args(argv):
     parser.add_argument("--logfile", help="file to write log to", default="%s.log" % __program__)
     parser.add_argument("--configfile", help="use a different config file", default="config.ini")
     parser.add_argument("--debug", action='store_true', default=False)
-    parser.add_argument("--input", "-i", help="folder to read images from")
+    parser.add_argument("--overwrite", action='store_true', default=False)
+    parser.add_argument("--input", "-i", help="folder to read images from", default="input")
     parser.add_argument("--output", "-o", help="folder to output processed images to", default="output")
 
     # uncomment this if you want to force at least one command line option
